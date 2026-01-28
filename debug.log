@@ -1,9 +1,0 @@
-(thunar:3176610): thunar-DEBUG: 18:30:07.783: Acquired the session message bus 'org.xfce.FileManager'
-
-(thunar:3176610): thunar-DEBUG: 18:30:07.783: Acquired the session message bus 'org.freedesktop.FileManager1'
-
-(thunar:3176610): thunar-DEBUG: 18:30:07.786: Acquired the name 'org.xfce.FileManager' on the session message bus
-
-(thunar:3176610): thunar-DEBUG: 18:30:07.786: Acquired the name 'org.freedesktop.FileManager1' on the session message bus
-
-(thunar:3176610): thunar-DEBUG: 18:30:07.802: Failed to create file monitor: Operation not supported
