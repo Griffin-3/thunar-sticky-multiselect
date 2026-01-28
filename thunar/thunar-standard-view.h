@@ -233,6 +233,14 @@ thunar_standard_view_set_statusbar_text (ThunarStandardView *standard_view,
 void
 thunar_standard_view_transfer_selection (ThunarStandardView *standard_view,
                                          ThunarStandardView *old_view);
+void
+thunar_standard_view_toggle_global_selection (ThunarStandardView *standard_view,
+                                              GFile              *file);
+gboolean
+thunar_standard_view_get_sticky_multi_select_mode (ThunarStandardView *standard_view);
+GList *
+thunar_standard_view_get_global_selection_filenames_for_dir (ThunarStandardView *standard_view,
+                                                             const char         *dir_path);
 
 
 G_END_DECLS;

@@ -39,6 +39,7 @@
 #include "thunar/thunar-gio-extensions.h"
 #include "thunar/thunar-gobject-extensions.h"
 #include "thunar/thunar-gtk-extensions.h"
+#include "thunar/thunar-global-selection.h"
 #include "thunar/thunar-history.h"
 #include "thunar/thunar-icon-renderer.h"
 #include "thunar/thunar-io-jobs.h"
@@ -61,6 +62,14 @@
 #endif
 
 #define THUNAR_STANDARD_VIEW_SELECTION_CHANGED_DELAY_MS 10
+
+/* debug macro for sticky multi-select development */
+#define grok_debug(...) \
+  do { \
+    g_print ("GROK: " __VA_ARGS__); \
+    g_print ("\n"); \
+    fflush (stdout); \
+  } while (0)
 
 
 
@@ -477,6 +486,12 @@ struct _ThunarStandardViewPrivate
   /* Used in order to throttle selection changes to prevent lag */
   gboolean selection_changed_requested;
   guint    selection_changed_timeout_source;
+
+  /* sticky multi-select mode support */
+  gboolean       sticky_multi_select_mode;
+  GlobalSelection *global_selection;
+  gchar          *cached_statusbar_text; /* cached status bar text to avoid unnecessary updates */
+  gboolean       transfer_in_progress; /* prevent auto-activation during view transfer */
 };
 
 /* clang-format off */
@@ -926,10 +941,19 @@ thunar_standard_view_view_init (ThunarViewIface *iface)
 static void
 thunar_standard_view_init (ThunarStandardView *standard_view)
 {
+  grok_debug ("INIT: Starting ThunarStandardView initialization");
+
   standard_view->priv = thunar_standard_view_get_instance_private (standard_view);
 
   standard_view->priv->selection_changed_timeout_source = 0;
   standard_view->priv->selection_changed_requested = FALSE;
+
+  /* initialize sticky multi-select mode */
+  grok_debug ("INIT: Initializing sticky multi-select mode");
+  standard_view->priv->sticky_multi_select_mode = FALSE;
+  standard_view->priv->global_selection = global_selection_new ();
+  standard_view->priv->cached_statusbar_text = NULL;
+  standard_view->priv->transfer_in_progress = FALSE;
 
   /* allocate the scroll_to_files mapping (directory GFile -> first visible child GFile) */
   standard_view->priv->scroll_to_files = g_hash_table_new_full (g_file_hash, (GEqualFunc) g_file_equal, g_object_unref, g_object_unref);
@@ -1202,8 +1226,18 @@ thunar_standard_view_finalize (GObject *object)
 
   g_mutex_clear (&standard_view->priv->statusbar_text_mutex);
 
+  grok_debug ("FINALIZE: Starting cleanup of sticky mode data");
+
   /* release the scroll_to_files hash table */
   g_hash_table_destroy (standard_view->priv->scroll_to_files);
+
+  /* release the global selection */
+  grok_debug ("FINALIZE: Freeing global selection");
+  global_selection_free (standard_view->priv->global_selection);
+
+  /* release the cached statusbar text */
+  grok_debug ("FINALIZE: Freeing cached statusbar text");
+  g_free (standard_view->priv->cached_statusbar_text);
 
   (*G_OBJECT_CLASS (thunar_standard_view_parent_class)->finalize) (object);
 }
@@ -1683,8 +1717,12 @@ thunar_standard_view_set_current_directory (ThunarNavigator *navigator,
   ThunarStandardView *standard_view = THUNAR_STANDARD_VIEW (navigator);
   ThunarFolder       *folder;
 
+  grok_debug ("SET_CURRENT_DIR: Setting current directory for view %p", standard_view);
+
   _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view));
   _thunar_return_if_fail (current_directory == NULL || THUNAR_IS_FILE (current_directory));
+
+  grok_debug ("SET_CURRENT_DIR: Validation passed");
 
   /* get the current directory */
   if (standard_view->priv->current_directory == current_directory)
@@ -1765,6 +1803,60 @@ thunar_standard_view_set_current_directory (ThunarNavigator *navigator,
   thunar_standard_view_model_set_folder (standard_view->model, folder, NULL);
   g_signal_handler_unblock (standard_view->model, standard_view->priv->row_deleted_id);
   g_object_unref (G_OBJECT (folder));
+
+  /* handle sticky mode directory navigation persistence */
+  if (standard_view->priv->sticky_multi_select_mode)
+    {
+      grok_debug ("STANDARD_VIEW: Directory changed in sticky mode, restoring selections");
+
+      /* get the path of the current directory */
+      GFile *current_dir_gfile = thunar_file_get_file (current_directory);
+      const char *current_dir_path = g_file_get_path (current_dir_gfile);
+
+      grok_debug ("STANDARD_VIEW: Restoring selections for directory: %s", current_dir_path);
+
+      /* get filenames that should be selected in this directory */
+      GList *selected_filenames = global_selection_get_filenames_in_dir (standard_view->priv->global_selection, current_dir_path);
+      GList *selected_files = NULL;
+      GList *lp;
+
+      grok_debug ("STANDARD_VIEW: Found %d files to select in this directory", g_list_length (selected_filenames));
+
+      /* convert filenames to ThunarFile objects for selection */
+      for (lp = selected_filenames; lp != NULL; lp = lp->next)
+        {
+          const char *filename = (const char *) lp->data;
+          ThunarFile *file;
+          char *full_path;
+
+          /* create full path */
+          full_path = g_build_filename (current_dir_path, filename, NULL);
+
+          /* create ThunarFile for this full path */
+          GFile *file_gfile = g_file_new_for_path (full_path);
+          file = thunar_file_get (file_gfile, NULL);
+
+          if (file != NULL)
+            {
+              selected_files = g_list_prepend (selected_files, file);
+              grok_debug ("STANDARD_VIEW: Will select file: %s", filename);
+            }
+
+          g_free (full_path);
+          g_object_unref (file_gfile);
+        }
+
+      /* store the files to select after model reconnection */
+      if (selected_files != NULL)
+        {
+          standard_view->priv->files_to_select = selected_files;
+          grok_debug ("STANDARD_VIEW: Stored %d files to select", g_list_length (selected_files));
+        }
+
+      /* clean up */
+      g_list_free_full (selected_filenames, g_free);
+      g_object_unref (current_dir_gfile);
+    }
 
   /* reconnect our model to the view */
   g_object_set (G_OBJECT (gtk_bin_get_child (GTK_BIN (standard_view))), "model", standard_view->model, NULL);
@@ -2473,6 +2565,37 @@ thunar_standard_view_update_statusbar_text_idle (gpointer data)
       exo_job_cancel (EXO_JOB (standard_view->priv->statusbar_job));
       g_object_unref (standard_view->priv->statusbar_job);
       standard_view->priv->statusbar_job = NULL;
+    }
+
+  /* check if we're in sticky multi-select mode */
+  if (standard_view->priv->sticky_multi_select_mode)
+    {
+      /* use the global selection totals directly */
+      statusbar_text = global_selection_get_totals (standard_view->priv->global_selection);
+
+      /* prepend "MultiSelect: " to the totals */
+      gchar *full_text = g_strdup_printf ("MultiSelect: %s", statusbar_text);
+
+      /* only update if the text has actually changed */
+      if (g_strcmp0 (standard_view->priv->cached_statusbar_text, full_text) != 0)
+        {
+          grok_debug ("STANDARD_VIEW: updating status bar in sticky mode");
+          grok_debug ("STANDARD_VIEW: global selection totals: %s", statusbar_text);
+          grok_debug ("STANDARD_VIEW: status bar text changed, updating");
+
+          thunar_standard_view_set_statusbar_text (standard_view, full_text);
+
+          /* update the cache */
+          g_free (standard_view->priv->cached_statusbar_text);
+          standard_view->priv->cached_statusbar_text = g_strdup (full_text);
+
+          g_object_notify_by_pspec (G_OBJECT (standard_view), standard_view_props[PROP_STATUSBAR_TEXT]);
+        }
+
+      g_free (statusbar_text);
+      g_free (full_text);
+
+      return FALSE;
     }
 
   /* query the selected items */
@@ -4310,6 +4433,90 @@ _thunar_standard_view_selection_changed (ThunarStandardView *standard_view)
   /* and setup the new selected files list */
   standard_view->priv->selected_files = selected_thunar_files;
 
+  /* auto-activate sticky mode if user has multiple selections (but not during transfer) */
+  if (!standard_view->priv->sticky_multi_select_mode && !standard_view->priv->transfer_in_progress && selected_thunar_files != NULL)
+    {
+      /* count selected items */
+      int count = g_list_length (selected_thunar_files);
+      if (count > 1)
+        {
+          grok_debug ("STANDARD_VIEW: Auto-activating sticky mode due to %d selected items", count);
+          standard_view->priv->sticky_multi_select_mode = TRUE;
+
+          /* initialize global selection with currently selected files */
+          for (lp = selected_thunar_files; lp != NULL; lp = lp->next)
+            {
+              ThunarFile *selected_file = THUNAR_FILE (lp->data);
+              if (selected_file != NULL)
+                {
+                  GFile *selected_gfile = thunar_file_get_file (selected_file);
+                  GFileInfo *info;
+                  const char *display_name;
+                  GFile *parent;
+                  char *dir_path;
+                  char *filename;
+                  gboolean is_dir;
+                  guint64 size;
+                  GError *error = NULL;
+
+                  /* get file information */
+                  info = g_file_query_info (selected_gfile,
+                                            G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME ","
+                                            G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+                                            G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                                            G_FILE_QUERY_INFO_NONE,
+                                            NULL,
+                                            &error);
+
+                  if (info != NULL)
+                    {
+                      display_name = g_file_info_get_display_name (info);
+                      size = g_file_info_get_size (info);
+                      is_dir = (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY);
+
+                      /* get directory path */
+                      parent = g_file_get_parent (selected_gfile);
+                      if (parent != NULL)
+                        {
+                          dir_path = g_file_get_path (parent);
+                          g_object_unref (parent);
+                        }
+                      else
+                        {
+                          dir_path = g_strdup ("/");
+                        }
+
+                      filename = g_strdup (display_name);
+
+                      grok_debug ("GLOBAL_SELECTION: Adding initially selected file: %s", g_file_get_path (selected_gfile));
+                      global_selection_add (standard_view->priv->global_selection, dir_path, filename, is_dir, size);
+
+                      g_free (dir_path);
+                      g_free (filename);
+                      g_object_unref (info);
+                    }
+                  else
+                    {
+                      grok_debug ("GLOBAL_SELECTION: Failed to query file info: %s", error->message);
+                      g_error_free (error);
+                    }
+
+                  g_object_unref (selected_gfile);
+                }
+            }
+
+          grok_debug ("GLOBAL_SELECTION: Initialized with %d files, %d dirs",
+                      standard_view->priv->global_selection->total_files,
+                      standard_view->priv->global_selection->total_dirs);
+
+          /* sync visual selection for details view when entering sticky mode */
+          if (THUNAR_IS_DETAILS_VIEW (standard_view))
+            {
+              thunar_details_view_sync_visual_selection (THUNAR_DETAILS_VIEW (standard_view));
+            }
+        }
+    }
+
   /* update the statusbar text */
   thunar_standard_view_update_statusbar_text (standard_view);
 
@@ -4903,8 +5110,15 @@ thunar_standard_view_transfer_selection (ThunarStandardView *standard_view,
 {
   GList *files;
 
+  grok_debug ("TRANSFER: Starting transfer_selection from %p to %p", old_view, standard_view);
+
   _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view));
   _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (old_view));
+
+  /* prevent auto-activation during transfer */
+  standard_view->priv->transfer_in_progress = TRUE;
+
+  grok_debug ("TRANSFER: Validation passed");
 
   if (standard_view->priv->files_to_select != NULL)
     g_list_free_full (standard_view->priv->files_to_select, g_object_unref);
@@ -4912,7 +5126,220 @@ thunar_standard_view_transfer_selection (ThunarStandardView *standard_view,
   if (old_view->priv->files_to_select != NULL)
     standard_view->priv->files_to_select = thunar_g_list_copy_deep (old_view->priv->files_to_select);
 
+  grok_debug ("TRANSFER: Copied files_to_select");
+
   files = thunar_component_get_selected_files (THUNAR_COMPONENT (old_view));
+  grok_debug ("TRANSFER: Got selected files from old view: %d files", g_list_length (files));
   if (files != NULL)
     thunar_component_set_selected_files (THUNAR_COMPONENT (standard_view), files);
+
+  grok_debug ("TRANSFER: Set selected files on new view");
+
+  /* transfer sticky multi-select mode state */
+  grok_debug ("TRANSFER: Transferring sticky mode state from old view to new view");
+  grok_debug ("TRANSFER: Old view sticky mode: %d", old_view->priv->sticky_multi_select_mode);
+
+  if (old_view->priv->sticky_multi_select_mode)
+    {
+      grok_debug ("TRANSFER: Old view was in sticky mode, activating in new view");
+
+      /* transfer sticky mode flag */
+      standard_view->priv->sticky_multi_select_mode = TRUE;
+      grok_debug ("TRANSFER: Set sticky mode flag to TRUE");
+
+      /* transfer global selection - we need to deep copy it */
+      if (old_view->priv->global_selection != NULL)
+        {
+          grok_debug ("TRANSFER: Old view has global selection, copying...");
+
+          /* free existing global selection if any */
+          if (standard_view->priv->global_selection != NULL)
+            {
+              grok_debug ("TRANSFER: Freeing existing global selection in new view");
+              global_selection_free (standard_view->priv->global_selection);
+            }
+
+          /* create new global selection and copy data */
+          grok_debug ("TRANSFER: Creating new global selection");
+          standard_view->priv->global_selection = global_selection_new ();
+          grok_debug ("TRANSFER: New global selection created");
+
+          /* copy the selection data - we need to iterate through the old selection */
+          if (old_view->priv->global_selection->dirs != NULL)
+            {
+              GHashTableIter dir_iter;
+              gpointer dir_key, dir_value;
+              int dir_count = 0;
+
+              grok_debug ("TRANSFER: Iterating through directories");
+              g_hash_table_iter_init (&dir_iter, old_view->priv->global_selection->dirs);
+              while (g_hash_table_iter_next (&dir_iter, &dir_key, &dir_value))
+                {
+                  const char *dir_path = (const char *) dir_key;
+                  GHashTable *old_sub_hash = (GHashTable *) dir_value;
+                  int file_count = 0;
+
+                  dir_count++;
+                  grok_debug ("TRANSFER: Processing directory %d: %s", dir_count, dir_path);
+
+                  if (old_sub_hash != NULL)
+                    {
+                      GHashTableIter file_iter;
+                      gpointer file_key, file_value;
+
+                      g_hash_table_iter_init (&file_iter, old_sub_hash);
+                      while (g_hash_table_iter_next (&file_iter, &file_key, &file_value))
+                        {
+                          const char *filename = (const char *) file_key;
+                          GlobalSelectionEntry *old_entry = (GlobalSelectionEntry *) file_value;
+
+                          file_count++;
+                          grok_debug ("TRANSFER: Processing file %d in dir %s: %s", file_count, dir_path, filename);
+
+                          /* add to new global selection */
+                          grok_debug ("TRANSFER: Adding %s/%s to new global selection", old_entry->dir_path, old_entry->filename);
+                          global_selection_add (standard_view->priv->global_selection,
+                                               old_entry->dir_path,
+                                               old_entry->filename,
+                                               old_entry->is_dir,
+                                               old_entry->size);
+                          grok_debug ("TRANSFER: Added successfully");
+                        }
+                      grok_debug ("TRANSFER: Processed %d files in directory %s", file_count, dir_path);
+                    }
+                  else
+                    {
+                      grok_debug ("TRANSFER: Directory %s has NULL sub_hash", dir_path);
+                    }
+                }
+              grok_debug ("TRANSFER: Processed %d directories total", dir_count);
+            }
+          else
+            {
+              grok_debug ("TRANSFER: Old global selection has no dirs hash table");
+            }
+
+          grok_debug ("TRANSFER: Copied global selection with %d files, %d dirs",
+                      standard_view->priv->global_selection->total_files,
+                      standard_view->priv->global_selection->total_dirs);
+        }
+      else
+        {
+          grok_debug ("TRANSFER: Old view has no global selection");
+        }
+    }
+    else
+    {
+      grok_debug ("TRANSFER: Old view was not in sticky mode");
+    }
+
+  /* reset transfer flag */
+  standard_view->priv->transfer_in_progress = FALSE;
+
+  grok_debug ("TRANSFER: Transfer completed successfully");
+}
+
+void
+thunar_standard_view_toggle_global_selection (ThunarStandardView *standard_view,
+                                              GFile              *file)
+{
+  GFileInfo *info;
+  const char *display_name;
+  GFile *parent;
+  char *dir_path;
+  char *filename;
+  gboolean is_dir;
+  guint64 size;
+  GError *error = NULL;
+
+  _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view));
+  _thunar_return_if_fail (G_IS_FILE (file));
+
+  grok_debug ("GLOBAL_SELECTION: toggle_global_selection called for: %s", g_file_get_path (file));
+  grok_debug ("GLOBAL_SELECTION: standard_view is %p, global_selection is %p", standard_view, standard_view->priv->global_selection);
+
+  /* get file information */
+  info = g_file_query_info (file,
+                            G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME ","
+                            G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+                            G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                            G_FILE_QUERY_INFO_NONE,
+                            NULL,
+                            &error);
+
+  if (info == NULL)
+    {
+      grok_debug ("GLOBAL_SELECTION: Failed to query file info: %s", error->message);
+      g_error_free (error);
+      return;
+    }
+
+  display_name = g_file_info_get_display_name (info);
+  size = g_file_info_get_size (info);
+  is_dir = (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY);
+
+  /* get directory path */
+  parent = g_file_get_parent (file);
+  if (parent != NULL)
+    {
+      dir_path = g_file_get_path (parent);
+      g_object_unref (parent);
+    }
+  else
+    {
+      /* root directory */
+      dir_path = g_strdup ("/");
+    }
+
+  filename = g_strdup (display_name);
+
+  /* check if already selected - if so, remove; if not, add */
+  GList *existing_files = global_selection_get_filenames_in_dir (standard_view->priv->global_selection, dir_path);
+  gboolean already_selected = (g_list_find_custom (existing_files, filename, (GCompareFunc) g_strcmp0) != NULL);
+
+  if (already_selected)
+    {
+      grok_debug ("GLOBAL_SELECTION: Removing file from global selection: %s/%s", dir_path, filename);
+      global_selection_remove (standard_view->priv->global_selection, dir_path, filename);
+    }
+  else
+    {
+      grok_debug ("GLOBAL_SELECTION: Adding file to global selection: %s/%s", dir_path, filename);
+      global_selection_add (standard_view->priv->global_selection, dir_path, filename, is_dir, size);
+    }
+
+  grok_debug ("STICKY: Global selection now has %d files, %d dirs",
+              standard_view->priv->global_selection->total_files,
+              standard_view->priv->global_selection->total_dirs);
+
+  /* clean up */
+  g_list_free_full (existing_files, g_free);
+  g_free (dir_path);
+  g_free (filename);
+  g_object_unref (info);
+
+  /* Use immediate update for sticky mode to prevent count lagging */
+  if (standard_view->priv->sticky_multi_select_mode)
+    thunar_standard_view_update_statusbar_text_idle (standard_view);
+}
+
+gboolean
+thunar_standard_view_get_sticky_multi_select_mode (ThunarStandardView *standard_view)
+{
+  _thunar_return_val_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view), FALSE);
+
+  return standard_view->priv->sticky_multi_select_mode;
+}
+
+GList *
+thunar_standard_view_get_global_selection_filenames_for_dir (ThunarStandardView *standard_view,
+                                                             const char         *dir_path)
+{
+  _thunar_return_val_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view), NULL);
+  _thunar_return_val_if_fail (dir_path != NULL, NULL);
+
+  if (standard_view->priv->global_selection != NULL)
+    return global_selection_get_filenames_in_dir (standard_view->priv->global_selection, dir_path);
+
+  return NULL;
 }

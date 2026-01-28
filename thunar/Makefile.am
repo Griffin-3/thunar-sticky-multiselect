@@ -184,6 +184,8 @@ thunar_SOURCES =							\
 	thunar-size-label.h						\
 	thunar-standard-view.c						\
 	thunar-standard-view.h						\
+	thunar-global-selection.c					\
+	thunar-global-selection.h					\
 	thunar-standard-view-model.c						\
 	thunar-standard-view-model.h						\
 	thunar-statusbar.c						\

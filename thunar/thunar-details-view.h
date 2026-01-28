@@ -49,6 +49,8 @@ void
 thunar_details_view_set_recency_column_visible (ThunarDetailsView *, gboolean);
 void
 thunar_details_view_set_location_column_visible (ThunarDetailsView *, gboolean);
+void
+thunar_details_view_sync_visual_selection (ThunarDetailsView *details_view);
 
 G_END_DECLS;
 

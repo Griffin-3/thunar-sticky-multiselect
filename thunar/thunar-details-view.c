@@ -24,6 +24,7 @@
 #include "thunar/thunar-action-manager.h"
 #include "thunar/thunar-column-editor.h"
 #include "thunar/thunar-details-view.h"
+#include "thunar/thunar-global-selection.h"
 #include "thunar/thunar-gtk-extensions.h"
 #include "thunar/thunar-preferences.h"
 #include "thunar/thunar-private.h"
@@ -31,6 +32,14 @@
 #include "thunar/thunar-window.h"
 
 #include <gdk/gdkkeysyms.h>
+
+/* debug macro for sticky multi-select development */
+#define grok_debug(...) \
+  do { \
+    g_print ("GROK: " __VA_ARGS__); \
+    g_print ("\n"); \
+    fflush (stdout); \
+  } while (0)
 
 
 
@@ -90,6 +99,17 @@ thunar_details_view_get_visible_range (ThunarStandardView *standard_view,
 static void
 thunar_details_view_highlight_path (ThunarStandardView *standard_view,
                                     GtkTreePath        *path);
+static gboolean
+thunar_details_view_select_function (GtkTreeSelection *selection,
+                                     GtkTreeModel     *model,
+                                     GtkTreePath      *path,
+                                     gboolean          path_currently_selected,
+                                     gpointer          data);
+static void
+thunar_details_view_selection_changed (ThunarDetailsView *details_view);
+static void
+thunar_details_view_current_directory_changed (ThunarDetailsView *details_view,
+                                               GParamSpec        *pspec);
 static void
 thunar_details_view_notify_model (GtkTreeView       *tree_view,
                                   GParamSpec        *pspec,
@@ -197,6 +217,10 @@ struct _ThunarDetailsView
   ExoTreeView *tree_view;
 
   gboolean expandable_folders;
+
+  /* prevent recursion during visual sync */
+  gboolean syncing_visual_selection;
+
 };
 
 
@@ -410,8 +434,9 @@ thunar_details_view_init (ThunarDetailsView *details_view)
   /* configure the tree selection */
   selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (details_view->tree_view));
   gtk_tree_selection_set_mode (selection, GTK_SELECTION_MULTIPLE);
+  gtk_tree_selection_set_select_function (selection, thunar_details_view_select_function, details_view, NULL);
   g_signal_connect_swapped (G_OBJECT (selection), "changed",
-                            G_CALLBACK (thunar_standard_view_selection_changed), details_view);
+                            G_CALLBACK (thunar_details_view_selection_changed), details_view);
 
   /* apply the initial column order and visibility from the column model */
   thunar_details_view_columns_changed (details_view->column_model, details_view);
@@ -440,6 +465,14 @@ thunar_details_view_init (ThunarDetailsView *details_view)
   g_signal_connect_swapped (THUNAR_STANDARD_VIEW (details_view)->preferences, "notify::misc-highlighting-enabled",
                             G_CALLBACK (thunar_details_view_highlight_option_changed), details_view);
   thunar_details_view_highlight_option_changed (details_view);
+
+
+  /* connect to directory change signal to restore sticky selection */
+  g_signal_connect (THUNAR_STANDARD_VIEW (details_view), "notify::current-directory",
+                    G_CALLBACK (thunar_details_view_current_directory_changed), details_view);
+
+  /* initialize sync flag */
+  details_view->syncing_visual_selection = FALSE;
 
   /* release the shared text renderers */
   g_object_unref (G_OBJECT (right_aligned_renderer));
@@ -842,6 +875,60 @@ thunar_details_view_button_press_event (GtkTreeView       *tree_view,
   if (path != NULL && event->type == GDK_BUTTON_PRESS && event->button == 1)
     {
       GtkTreePath *cursor_path;
+
+      grok_debug ("DETAILS_VIEW: button press event on path %s", gtk_tree_path_to_string (path));
+
+      /* check if we're in sticky multi-select mode */
+      if (thunar_standard_view_get_sticky_multi_select_mode (THUNAR_STANDARD_VIEW (details_view)))
+        {
+          grok_debug ("DETAILS_VIEW: in sticky mode, handling click");
+
+          /* in sticky mode, single left-clicks should toggle selection */
+          if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) == 0 && column == name_column)
+            {
+              /* handle single click as toggle using global selection system */
+              if (gtk_tree_model_get_iter (model, &iter, path))
+                {
+                  file = thunar_standard_view_model_get_file (THUNAR_STANDARD_VIEW_MODEL (model), &iter);
+                  if (file != NULL)
+                    {
+                      grok_debug ("DETAILS_VIEW: processing file click: %s", thunar_file_get_display_name (file));
+
+                      /* toggle selection in global selection system (same as icon/compact views) */
+                      thunar_standard_view_toggle_global_selection (THUNAR_STANDARD_VIEW (details_view), thunar_file_get_file (file));
+
+                      /* update the local visual selection for this path only (like icon view does) */
+                      {
+                        GtkTreeSelection *sel = gtk_tree_view_get_selection (GTK_TREE_VIEW (details_view->tree_view));
+
+                        /* temporarily allow selection changes to update visual state */
+                        gtk_tree_selection_set_select_function (sel, NULL, NULL, NULL);
+
+                        if (gtk_tree_selection_path_is_selected (sel, path))
+                          gtk_tree_selection_unselect_path (sel, path);
+                        else
+                          gtk_tree_selection_select_path (sel, path);
+
+                        /* restore blocking select function */
+                        gtk_tree_selection_set_select_function (sel, thunar_details_view_select_function, details_view, NULL);
+                      }
+
+                      /* status bar will be updated automatically by the global selection change */
+
+                      g_object_unref (file);
+                    }
+                }
+
+              gtk_tree_path_free (path);
+              return TRUE; /* handled - we ate the event */
+            }
+          else if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) != 0)
+            {
+              /* allow Ctrl/Shift clicks to fall through to GTK for range/add behavior */
+              grok_debug ("DETAILS_VIEW: allowing modifier click to pass through");
+              /* don't return TRUE here, let GTK handle it */
+            }
+        }
 
       /* find out if the expander was clicked;
        * only needed if expandable folders is enabled */
@@ -1682,6 +1769,139 @@ thunar_details_view_toggle_expandable_folders (ThunarDetailsView *details_view)
   return TRUE;
 }
 
+
+
+static gboolean
+thunar_details_view_select_function (GtkTreeSelection *selection,
+                                     GtkTreeModel     *model,
+                                     GtkTreePath      *path,
+                                     gboolean          path_currently_selected,
+                                     gpointer          data)
+{
+  ThunarDetailsView *details_view = THUNAR_DETAILS_VIEW (data);
+
+  grok_debug ("DETAILS_VIEW: select_function called: path=%s, currently_selected=%d, sticky_mode=%d",
+              gtk_tree_path_to_string (path), path_currently_selected,
+              thunar_standard_view_get_sticky_multi_select_mode (THUNAR_STANDARD_VIEW (details_view)));
+
+  /* in sticky mode, block all GTK selection changes */
+  if (thunar_standard_view_get_sticky_multi_select_mode (THUNAR_STANDARD_VIEW (details_view)))
+    {
+      grok_debug ("DETAILS_VIEW: STICKY MODE - BLOCKING GTK selection attempt");
+      return FALSE; /* block the selection change */
+    }
+
+  /* allow normal GTK behavior when not in sticky mode */
+  grok_debug ("DETAILS_VIEW: allowing selection (normal mode)");
+  return TRUE;
+}
+
+void
+thunar_details_view_sync_visual_selection (ThunarDetailsView *details_view)
+{
+  GtkTreeSelection *selection;
+  GtkTreeModel *model;
+  GtkTreeIter iter;
+  ThunarFile *file;
+  GList *selected_filenames = NULL;
+  GList *lp;
+  gboolean valid;
+
+  grok_debug ("DETAILS_VIEW: syncing visual selection with global selection (simple version)");
+
+  /* set flag to prevent selection_changed recursion */
+  details_view->syncing_visual_selection = TRUE;
+
+  selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (details_view->tree_view));
+  model = gtk_tree_view_get_model (GTK_TREE_VIEW (details_view->tree_view));
+
+  /* get the current directory */
+  ThunarFile *current_directory = thunar_navigator_get_current_directory (THUNAR_NAVIGATOR (THUNAR_STANDARD_VIEW (details_view)));
+  if (current_directory != NULL)
+    {
+      GFile *current_dir_gfile = thunar_file_get_file (current_directory);
+      const char *current_dir_path = g_file_get_path (current_dir_gfile);
+
+      /* get filenames that should be selected in current directory */
+      selected_filenames = thunar_standard_view_get_global_selection_filenames_for_dir (THUNAR_STANDARD_VIEW (details_view), current_dir_path);
+
+      g_object_unref (current_dir_gfile);
+      g_object_unref (current_directory);
+    }
+
+  /* temporarily set select function to NULL to allow direct selection manipulation */
+  gtk_tree_selection_set_select_function (selection, NULL, NULL, NULL);
+
+  /* unselect all current selections */
+  gtk_tree_selection_unselect_all (selection);
+
+  /* iterate through the model and select files that are in the selected_filenames list */
+  grok_debug ("DETAILS_VIEW: starting model iteration, selected_filenames has %d items", g_list_length (selected_filenames));
+  valid = gtk_tree_model_get_iter_first (model, &iter);
+  while (valid)
+    {
+      file = thunar_standard_view_model_get_file (THUNAR_STANDARD_VIEW_MODEL (model), &iter);
+      if (file != NULL)
+        {
+          const char *display_name = thunar_file_get_display_name (file);
+          grok_debug ("DETAILS_VIEW: checking file: %s", display_name);
+
+          /* check if this file's display name is in the selected filenames list */
+          for (lp = selected_filenames; lp != NULL; lp = lp->next)
+            {
+              if (g_strcmp0 ((const char *) lp->data, display_name) == 0)
+                {
+                  GtkTreePath *path = gtk_tree_model_get_path (model, &iter);
+                  grok_debug ("DETAILS_VIEW: selecting path %s for globally selected file: %s", gtk_tree_path_to_string (path), display_name);
+                  gtk_tree_selection_select_path (selection, path);
+                  gtk_tree_path_free (path);
+                  grok_debug ("DETAILS_VIEW: path selected successfully");
+                  break;
+                }
+            }
+
+          g_object_unref (file);
+        }
+      valid = gtk_tree_model_iter_next (model, &iter);
+    }
+  grok_debug ("DETAILS_VIEW: finished model iteration");
+
+  /* restore blocking select function */
+  gtk_tree_selection_set_select_function (selection, thunar_details_view_select_function, details_view, NULL);
+
+  /* free the selected filenames list */
+  g_list_free_full (selected_filenames, g_free);
+
+  grok_debug ("DETAILS_VIEW: visual selection sync completed");
+
+  /* clear flag */
+  details_view->syncing_visual_selection = FALSE;
+}
+
+static void
+thunar_details_view_selection_changed (ThunarDetailsView *details_view)
+{
+  grok_debug ("DETAILS_VIEW: selection_changed called (syncing=%d)", details_view->syncing_visual_selection);
+
+  /* ignore selection changes during visual sync to prevent recursion */
+  if (details_view->syncing_visual_selection)
+    {
+      grok_debug ("DETAILS_VIEW: ignoring selection_changed during visual sync");
+      return;
+    }
+
+  /* delegate to standard view for sticky mode activation and status bar handling */
+  thunar_standard_view_selection_changed (THUNAR_STANDARD_VIEW (details_view));
+}
+
+static void
+thunar_details_view_current_directory_changed (ThunarDetailsView *details_view,
+                                               GParamSpec        *pspec)
+{
+  grok_debug ("DETAILS_VIEW: current directory changed");
+
+  /* the standard view handles directory changes and selection restoration for sticky mode */
+}
 
 
 static void

@@ -32,6 +32,13 @@
 
 #include <gdk/gdkkeysyms.h>
 
+/* debug macro for sticky multi-select development */
+#define grok_debug(...) \
+  do { \
+    g_print ("GROK: " __VA_ARGS__); \
+    g_print ("\n"); \
+    fflush (stdout); \
+  } while (0)
 
 
 static void
@@ -416,12 +423,60 @@ thunar_abstract_icon_view_button_press_event (ExoIconView            *view,
                                               GdkEventButton         *event,
                                               ThunarAbstractIconView *abstract_icon_view)
 {
-  GtkTreePath *path;
+  GtkTreePath *path = NULL;
   GtkWidget   *window;
 
   /* give focus to the clicked view */
   window = gtk_widget_get_toplevel (GTK_WIDGET (abstract_icon_view));
   thunar_window_focus_view (THUNAR_WINDOW (window), GTK_WIDGET (abstract_icon_view));
+
+  /* check if we're in sticky multi-select mode and handle left-clicks specially */
+  if (event->type == GDK_BUTTON_PRESS && event->button == 1)
+    {
+      ThunarStandardView *standard_view = THUNAR_STANDARD_VIEW (abstract_icon_view);
+
+      /* check if we're in sticky multi-select mode */
+      if (thunar_standard_view_get_sticky_multi_select_mode (standard_view))
+        {
+          grok_debug ("ABSTRACT_ICON_VIEW: in sticky mode, handling click");
+
+          /* in sticky mode, single left-clicks should toggle selection */
+          if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) == 0)
+            {
+              /* determine the path to the item that was clicked */
+              if (exo_icon_view_get_item_at_pos (view, event->x, event->y, &path, NULL))
+                {
+                  ThunarFile *file = NULL;
+                  GtkTreeIter iter;
+
+                  /* get the file for this path */
+                  if (gtk_tree_model_get_iter (GTK_TREE_MODEL (THUNAR_STANDARD_VIEW (abstract_icon_view)->model), &iter, path))
+                    {
+                      file = thunar_standard_view_model_get_file (THUNAR_STANDARD_VIEW_MODEL (THUNAR_STANDARD_VIEW (abstract_icon_view)->model), &iter);
+                    }
+
+                  if (file != NULL)
+                    {
+                      grok_debug ("ABSTRACT_ICON_VIEW: processing file click: %s", thunar_file_get_display_name (file));
+
+                      /* toggle selection in global collection */
+                      thunar_standard_view_toggle_global_selection (standard_view, thunar_file_get_file (file));
+
+                      /* update the local selection to match */
+                      if (exo_icon_view_path_is_selected (view, path))
+                        exo_icon_view_unselect_path (view, path);
+                      else
+                        exo_icon_view_select_path (view, path);
+
+                      g_object_unref (file);
+                    }
+
+                  gtk_tree_path_free (path);
+                  return TRUE; /* handled */
+                }
+            }
+        }
+    }
 
   if (event->type == GDK_BUTTON_PRESS && event->button == 3)
     {
