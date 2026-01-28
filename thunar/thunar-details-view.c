@@ -108,6 +108,8 @@ thunar_details_view_select_function (GtkTreeSelection *selection,
 static void
 thunar_details_view_selection_changed (ThunarDetailsView *details_view);
 static void
+thunar_details_view_select_range (ThunarDetailsView *details_view, GtkTreePath *start_path, GtkTreePath *end_path);
+static void
 thunar_details_view_current_directory_changed (ThunarDetailsView *details_view,
                                                GParamSpec        *pspec);
 static void
@@ -220,6 +222,9 @@ struct _ThunarDetailsView
 
   /* prevent recursion during visual sync */
   gboolean syncing_visual_selection;
+
+  /* last clicked path for range selection */
+  GtkTreePath *last_clicked_path;
 
 };
 
@@ -474,6 +479,9 @@ thunar_details_view_init (ThunarDetailsView *details_view)
   /* initialize sync flag */
   details_view->syncing_visual_selection = FALSE;
 
+  /* initialize last clicked path */
+  details_view->last_clicked_path = NULL;
+
   /* release the shared text renderers */
   g_object_unref (G_OBJECT (right_aligned_renderer));
   g_object_unref (G_OBJECT (left_aligned_renderer));
@@ -552,6 +560,10 @@ thunar_details_view_finalize (GObject *object)
 
   g_signal_handlers_disconnect_by_func (G_OBJECT (THUNAR_STANDARD_VIEW (details_view)->preferences),
                                         thunar_details_view_highlight_option_changed, details_view);
+
+  /* free the last clicked path */
+  if (details_view->last_clicked_path != NULL)
+    gtk_tree_path_free (details_view->last_clicked_path);
 
   (*G_OBJECT_CLASS (thunar_details_view_parent_class)->finalize) (object);
 }
@@ -883,10 +895,46 @@ thunar_details_view_button_press_event (GtkTreeView       *tree_view,
         {
           grok_debug ("DETAILS_VIEW: in sticky mode, handling click");
 
-          /* in sticky mode, single left-clicks should toggle selection */
-          if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) == 0 && column == name_column)
+          /* handle clicks on the name column */
+          if (column == name_column)
             {
-              /* handle single click as toggle using global selection system */
+              /* Ctrl-click: toggle selection (same as left-click) */
+              if ((event->state & GDK_CONTROL_MASK) != 0 && (event->state & GDK_SHIFT_MASK) == 0)
+                {
+                  grok_debug ("DETAILS_VIEW: Ctrl-click - toggle selection");
+                  /* handle as toggle */
+                }
+              /* Shift-click: range selection */
+              else if ((event->state & GDK_SHIFT_MASK) != 0 && (event->state & GDK_CONTROL_MASK) == 0)
+                {
+                  grok_debug ("DETAILS_VIEW: Shift-click - range selection");
+                  /* handle range selection from last clicked to current */
+                  if (details_view->last_clicked_path != NULL)
+                    {
+                      /* select range and add to global selection */
+                      thunar_details_view_select_range (details_view, details_view->last_clicked_path, path);
+                      /* update last clicked path */
+                      gtk_tree_path_free (details_view->last_clicked_path);
+                      details_view->last_clicked_path = gtk_tree_path_copy (path);
+                      gtk_tree_path_free (path);
+                      return TRUE; /* handled */
+                    }
+                  /* if no last clicked, treat as single toggle */
+                }
+              /* Plain left-click: toggle selection */
+              else if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) == 0)
+                {
+                  grok_debug ("DETAILS_VIEW: left-click - toggle selection");
+                  /* handle as toggle */
+                }
+              else
+                {
+                  /* other modifier combinations not supported in sticky mode */
+                  gtk_tree_path_free (path);
+                  return TRUE;
+                }
+
+              /* handle toggle selection (for left-click and ctrl-click) */
               if (gtk_tree_model_get_iter (model, &iter, path))
                 {
                   file = thunar_standard_view_model_get_file (THUNAR_STANDARD_VIEW_MODEL (model), &iter);
@@ -894,10 +942,10 @@ thunar_details_view_button_press_event (GtkTreeView       *tree_view,
                     {
                       grok_debug ("DETAILS_VIEW: processing file click: %s", thunar_file_get_display_name (file));
 
-                      /* toggle selection in global selection system (same as icon/compact views) */
+                      /* toggle selection in global selection system */
                       thunar_standard_view_toggle_global_selection (THUNAR_STANDARD_VIEW (details_view), thunar_file_get_file (file));
 
-                      /* update the local visual selection for this path only (like icon view does) */
+                      /* update the local visual selection for this path only */
                       {
                         GtkTreeSelection *sel = gtk_tree_view_get_selection (GTK_TREE_VIEW (details_view->tree_view));
 
@@ -913,7 +961,10 @@ thunar_details_view_button_press_event (GtkTreeView       *tree_view,
                         gtk_tree_selection_set_select_function (sel, thunar_details_view_select_function, details_view, NULL);
                       }
 
-                      /* status bar will be updated automatically by the global selection change */
+                      /* update last clicked path */
+                      if (details_view->last_clicked_path != NULL)
+                        gtk_tree_path_free (details_view->last_clicked_path);
+                      details_view->last_clicked_path = gtk_tree_path_copy (path);
 
                       g_object_unref (file);
                     }
@@ -921,12 +972,6 @@ thunar_details_view_button_press_event (GtkTreeView       *tree_view,
 
               gtk_tree_path_free (path);
               return TRUE; /* handled - we ate the event */
-            }
-          else if ((event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) != 0)
-            {
-              /* allow Ctrl/Shift clicks to fall through to GTK for range/add behavior */
-              grok_debug ("DETAILS_VIEW: allowing modifier click to pass through");
-              /* don't return TRUE here, let GTK handle it */
             }
         }
 
@@ -1797,6 +1842,56 @@ thunar_details_view_select_function (GtkTreeSelection *selection,
 }
 
 void
+thunar_details_view_select_range (ThunarDetailsView *details_view, GtkTreePath *start_path, GtkTreePath *end_path)
+{
+  GtkTreeModel *model = gtk_tree_view_get_model (GTK_TREE_VIEW (details_view->tree_view));
+  GtkTreeSelection *sel = gtk_tree_view_get_selection (GTK_TREE_VIEW (details_view->tree_view));
+  GtkTreePath *path;
+  GtkTreeIter iter;
+  gint start_idx, end_idx, i;
+
+  grok_debug ("DETAILS_VIEW: selecting range from %s to %s", gtk_tree_path_to_string (start_path), gtk_tree_path_to_string (end_path));
+
+  /* get indices */
+  start_idx = gtk_tree_path_get_indices (start_path)[0];
+  end_idx = gtk_tree_path_get_indices (end_path)[0];
+
+  if (start_idx > end_idx)
+    {
+      gint temp = start_idx;
+      start_idx = end_idx;
+      end_idx = temp;
+    }
+
+  /* temporarily allow selection changes */
+  gtk_tree_selection_set_select_function (sel, NULL, NULL, NULL);
+
+  /* iterate through range and select each item */
+  for (i = start_idx; i <= end_idx; i++)
+    {
+      path = gtk_tree_path_new_from_indices (i, -1);
+      if (gtk_tree_model_get_iter (model, &iter, path))
+        {
+          ThunarFile *file = thunar_standard_view_model_get_file (THUNAR_STANDARD_VIEW_MODEL (model), &iter);
+          if (file != NULL)
+            {
+              /* add to global selection */
+              thunar_standard_view_toggle_global_selection (THUNAR_STANDARD_VIEW (details_view), thunar_file_get_file (file));
+
+              /* add to visual selection */
+              gtk_tree_selection_select_path (sel, path);
+
+              g_object_unref (file);
+            }
+        }
+      gtk_tree_path_free (path);
+    }
+
+  /* restore blocking select function */
+  gtk_tree_selection_set_select_function (sel, thunar_details_view_select_function, details_view, NULL);
+}
+
+void
 thunar_details_view_sync_visual_selection (ThunarDetailsView *details_view)
 {
   GtkTreeSelection *selection;
@@ -1899,6 +1994,13 @@ thunar_details_view_current_directory_changed (ThunarDetailsView *details_view,
                                                GParamSpec        *pspec)
 {
   grok_debug ("DETAILS_VIEW: current directory changed");
+
+  /* reset last clicked path when directory changes */
+  if (details_view->last_clicked_path != NULL)
+    {
+      gtk_tree_path_free (details_view->last_clicked_path);
+      details_view->last_clicked_path = NULL;
+    }
 
   /* the standard view handles directory changes and selection restoration for sticky mode */
 }
